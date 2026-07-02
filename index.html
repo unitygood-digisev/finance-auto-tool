@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>財務即時結算系統</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.3.0/exceljs.min.js"></script>
+  <style>
+    /* 莫蘭迪色系 UI 設定 */
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background-color: #EAEBE9; /* 淺灰綠背景 */
+      color: #4A4A4A;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      margin: 0;
+    }
+    .container {
+      background: #FFFFFF;
+      padding: 40px;
+      border-radius: 12px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.04);
+      width: 100%;
+      max-width: 450px;
+      text-align: center;
+    }
+    h2 { margin-top: 0; color: #6D7973; }
+    .input-group { margin-bottom: 20px; }
+    input[type="number"] {
+      padding: 8px 12px;
+      width: 120px;
+      border: 1px solid #C4C9C5;
+      border-radius: 6px;
+      font-size: 16px;
+      text-align: center;
+      color: #4A4A4A;
+    }
+    .drop-zone {
+      border: 2px dashed #B5C4B1;
+      border-radius: 8px;
+      padding: 50px 20px;
+      background-color: #F7F9F7;
+      cursor: pointer;
+      transition: all 0.3s ease;
+      color: #8FA08A;
+      font-weight: 500;
+      margin-bottom: 20px;
+    }
+    .drop-zone.dragover {
+      background-color: #E2E8E0;
+      border-color: #8FA08A;
+    }
+    .log {
+      font-size: 13px;
+      color: #C06C5A; /* 莫蘭迪磚紅警示色 */
+      text-align: left;
+      white-space: pre-wrap;
+      margin-top: 15px;
+    }
+    .spinner {
+      display: none;
+      margin: 10px auto;
+      border: 3px solid #f3f3f3;
+      border-top: 3px solid #8FA08A;
+      border-radius: 50%;
+      width: 24px;
+      height: 24px;
+      animation: spin 1s linear infinite;
+    }
+    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+
+  <div class="container">
+    <h2>月度核銷全自動結算</h2>
+    
+    <div class="input-group">
+      <label style="font-weight: bold; margin-right: 10px;">結算年份：</label>
+      <input type="number" id="yearInput" value="2026">
+    </div>
+
+    <div class="drop-zone" id="dropZone">
+      請將含有「輸入、輸出、科目對應」的<br>Excel 檔案拖曳至此<br><br><span style="font-size: 12px; color: #A0AAB2;">或點擊選擇檔案</span>
+      <input type="file" id="fileInput" accept=".xlsx" style="display: none;">
+    </div>
+    
+    <div class="spinner" id="spinner"></div>
+    <div class="log" id="log"></div>
+  </div>
+
+  <script>
+    const dropZone = document.getElementById('dropZone');
+    const fileInput = document.getElementById('fileInput');
+    const logEl = document.getElementById('log');
+    const spinner = document.getElementById('spinner');
+
+    // 點擊觸發檔案選擇
+    dropZone.addEventListener('click', () => fileInput.click());
+
+    // 拖曳事件處理
+    dropZone.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      dropZone.classList.add('dragover');
+    });
+    dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+    dropZone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dropZone.classList.remove('dragover');
+      if (e.dataTransfer.files.length) {
+        processExcel(e.dataTransfer.files[0]);
+      }
+    });
+    fileInput.addEventListener('change', (e) => {
+      if (e.target.files.length) {
+        processExcel(e.target.files[0]);
+      }
+    });
+
+    async function processExcel(file) {
+      const targetYear = parseInt(document.getElementById('yearInput').value);
+      if (!targetYear || isNaN(targetYear)) {
+        logEl.innerText = "請輸入正確的年份！"; return;
+      }
+
+      logEl.innerText = "";
+      spinner.style.display = "block";
+      dropZone.style.pointerEvents = "none";
+
+      try {
+        const arrayBuffer = await file.arrayBuffer();
+        const workbook = new ExcelJS.Workbook();
+        await workbook.xlsx.load(arrayBuffer);
+
+        const sheetIn = workbook.getWorksheet('輸入(核銷單)');
+        const sheetOut = workbook.getWorksheet('輸出');
+        const sheetMap = workbook.getWorksheet('科目對應');
+
+        if (!sheetIn || !sheetOut || !sheetMap) {
+          throw new Error("檔案必須包含「輸入(核銷單)」、「輸出」與「科目對應」三個分頁！");
+        }
+
+        // 1. 建立字典 (Mapping)
+        const catToAccountDict = {};
+        const allAccounts = new Set();
+        let mapCatCol = -1, mapAccCol = -1;
+        
+        sheetMap.getRow(1).eachCell((cell, colNum) => {
+          if (cell.value === '核銷類別') mapCatCol = colNum;
+          if (cell.value === '科目名稱') mapAccCol = colNum;
+        });
+
+        sheetMap.eachRow((row, rowNum) => {
+          if (rowNum === 1) return;
+          const cat = row.getCell(mapCatCol).text?.trim();
+          const acc = row.getCell(mapAccCol).text?.trim();
+          if (cat && acc) {
+            catToAccountDict[cat] = acc;
+            allAccounts.add(acc);
+          }
+        });
+
+        // 2. 初始化加總陣列 aggregated[科目][月份] = 金額
+        const aggregated = {};
+        allAccounts.forEach(acc => {
+          aggregated[acc] = {1:0, 2:0, 3:0, 4:0, 5:0, 6:0, 7:0, 8:0, 9:0, 10:0, 11:0, 12:0};
+        });
+
+        // 3. 讀取輸入單並加總
+        let inDateCol = -1, inCatCol = -1, inAmountCol = -1, inStatusCol = -1;
+        sheetIn.getRow(1).eachCell((cell, colNum) => {
+          if (cell.value === '日期') inDateCol = colNum;
+          if (cell.value === '核銷類別') inCatCol = colNum;
+          if (cell.value === '金額') inAmountCol = colNum;
+          if (cell.value === '狀態') inStatusCol = colNum;
+        });
+
+        const unmappedCats = new Set();
+        let validCount = 0;
+
+        sheetIn.eachRow((row, rowNum) => {
+          if (rowNum === 1) return;
+          const dateCell = row.getCell(inDateCol).value;
+          const statusVal = inStatusCol !== -1 ? row.getCell(inStatusCol).text?.trim() : '通過';
+          
+          let dateVal = dateCell instanceof Date ? dateCell : new Date(dateCell);
+
+          if (!isNaN(dateVal) && dateVal.getFullYear() === targetYear && statusVal === '通過') {
+            const originalCat = row.getCell(inCatCol).text?.trim();
+            const amount = parseFloat(row.getCell(inAmountCol).value) || 0;
+
+            if (!originalCat) return;
+            const targetAcc = catToAccountDict[originalCat];
+
+            if (targetAcc) {
+              const month = dateVal.getMonth() + 1;
+              aggregated[targetAcc][month] += amount;
+              validCount++;
+            } else {
+              unmappedCats.add(originalCat);
+            }
+          }
+        });
+
+        // 4. 更新輸出表
+        let outHeaderRow = -1;
+        let outAccCol = -1;
+        const monthCols = {};
+
+        sheetOut.eachRow((row, rowNum) => {
+          let hasAcc = false, hasJan = false;
+          row.eachCell((cell, colNum) => {
+            if (cell.value === '會計科目') { hasAcc = true; outAccCol = colNum; }
+            for (let m = 1; m <= 12; m++) {
+              if (cell.value === `${m}月`) { hasJan = true; monthCols[m] = colNum; }
+            }
+          });
+          if (hasAcc && hasJan && outHeaderRow === -1) outHeaderRow = rowNum;
+        });
+
+        sheetOut.eachRow((row, rowNum) => {
+          if (rowNum <= outHeaderRow) return;
+          const accName = row.getCell(outAccCol).text?.trim();
+          
+          if (accName && aggregated[accName]) {
+            for (let m = 1; m <= 12; m++) {
+              if (monthCols[m]) {
+                const finalAmount = aggregated[accName][m];
+                row.getCell(monthCols[m]).value = finalAmount > 0 ? finalAmount : null;
+              }
+            }
+          }
+        });
+
+        // 5. 下載檔案
+        const buffer = await workbook.xlsx.writeBuffer();
+        const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `結算完成_${targetYear}年總表.xlsx`;
+        a.click();
+        window.URL.revokeObjectURL(url);
+
+        // 產出報告
+        let msg = `🎉 處理完成！已自動下載檔案。\n共核算 ${validCount} 筆單據。`;
+        if (unmappedCats.size > 0) {
+          msg += `\n\n⚠️ 以下前端類別未在字典中找到對應，已被忽略：\n` + Array.from(unmappedCats).join("、");
+        }
+        logEl.style.color = unmappedCats.size > 0 ? "#C06C5A" : "#8FA08A";
+        logEl.innerText = msg;
+
+      } catch (err) {
+        logEl.style.color = "#C06C5A";
+        logEl.innerText = "❌ 發生錯誤：" + err.message;
+      } finally {
+        spinner.style.display = "none";
+        dropZone.style.pointerEvents = "auto";
+        fileInput.value = ""; // Reset file input
+      }
+    }
+  </script>
+</body>
+</html>
